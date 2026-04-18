@@ -13,7 +13,7 @@
 %
 % 数据结构：
 %   data/
-%     image/  -> image1.tif, image2.tif, image3.tif  (uint16, 多页3D体积)
+%     image/  -> image1.tif, image2.tif, image3.tif  (uint8, 多页3D体积)
 %     label/  -> label1.tif, label2.tif, label3.tif  (uint8, 0和255二值标签)
 
 clear; clc; close all;
@@ -69,7 +69,7 @@ for v = 1:numVolumes
     H = infoImg(1).Height;
     W = infoImg(1).Width;
 
-    vol = zeros(H, W, numSlices, 'uint16');
+    vol = zeros(H, W, numSlices, 'uint8');
     for s = 1:numSlices
         vol(:,:,s) = imread(imgPath, s);
     end
@@ -179,24 +179,8 @@ fprintf('=== 第4步：构建3D U-Net网络 ===\n');
 
 inputSize = [patchSize, numChannels]; % [64 64 64 1]
 
-% 创建3D U-Net层图（需要 Computer Vision Toolbox）
-lgraph = unet3dLayers(inputSize, numClasses, 'EncoderDepth', encoderDepth);
-
-% 移除softmax层和输出分类层（trainnet的crossentropy会自动处理softmax）
-layersToRemove = {};
-for i = 1:numel(lgraph.Layers)
-    layerClass = class(lgraph.Layers(i));
-    if contains(layerClass, 'SoftmaxLayer', 'IgnoreCase', true) || ...
-       contains(layerClass, 'ClassificationLayer', 'IgnoreCase', true)
-        layersToRemove{end+1} = lgraph.Layers(i).Name; %#ok<SAGROW>
-    end
-end
-if ~isempty(layersToRemove)
-    lgraph = removeLayers(lgraph, layersToRemove);
-end
-
-% 转换为 dlnetwork 以配合 trainnet 使用
-net = dlnetwork(lgraph);
+% 使用 unet3d 函数直接创建 3D U-Net dlnetwork（需要 Computer Vision Toolbox）
+net = unet3d(inputSize, numClasses, 'EncoderDepth', encoderDepth);
 
 fprintf('3D U-Net 网络构建完成，共 %d 层。\n\n', numel(net.Layers));
 
@@ -251,7 +235,7 @@ H = infoTest(1).Height;
 W = infoTest(1).Width;
 
 % 读取测试图像
-testVol = zeros(H, W, numSlices, 'uint16');
+testVol = zeros(H, W, numSlices, 'uint8');
 for s = 1:numSlices
     testVol(:,:,s) = imread(testImgPath, s);
 end
