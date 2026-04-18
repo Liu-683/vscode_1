@@ -85,12 +85,18 @@ for v = 1:numVolumes
         size(vol, 1), size(vol, 2), size(vol, 3), ...
         size(lbl, 1), size(lbl, 2), size(lbl, 3));
 
-    % --- 将图像归一化到 [0, 1] ---
-    maxVal = single(max(vol(:)));
-    if maxVal > 0
-        vol = single(vol) / maxVal;
+    % --- 将图像归一化到 [0, 1]（使用百分位裁剪，抗异常值） ---
+    vol = single(vol);
+    pLow  = prctile(vol(:), 0.5);
+    pHigh = prctile(vol(:), 99.5);
+    if pHigh > pLow
+        vol = (vol - pLow) / (pHigh - pLow);
+        vol = max(min(vol, 1), 0);
     else
-        vol = single(vol);
+        maxVal = max(vol(:));
+        if maxVal > 0
+            vol = vol / maxVal;
+        end
     end
 
     % --- 将标签转换为类别索引：0->1(背景), 255->2(前景) ---
@@ -198,6 +204,34 @@ end
 % 转换为 dlnetwork 以配合 trainnet 使用
 net = dlnetwork(lgraph);
 
+% 重新初始化最后一层卷积的权重，确保初始输出(logits)接近0，
+% 使得 softmax 输出接近均匀分布，避免初始Loss过高
+finalConvName = '';
+for i = numel(net.Layers):-1:1
+    if contains(class(net.Layers(i)), 'Convolution', 'IgnoreCase', true)
+        finalConvName = net.Layers(i).Name;
+        break;
+    end
+end
+if ~isempty(finalConvName)
+    layerNames = string(net.Learnables.Layer);
+    paramTypes = string(net.Learnables.Parameter);
+
+    wIdx = find(layerNames == finalConvName & paramTypes == "Weights");
+    if ~isempty(wIdx)
+        wSize = size(net.Learnables.Value{wIdx});
+        net.Learnables.Value{wIdx} = dlarray(single(randn(wSize) * 0.001));
+    end
+
+    bIdx = find(layerNames == finalConvName & paramTypes == "Bias");
+    if ~isempty(bIdx)
+        bSize = size(net.Learnables.Value{bIdx});
+        net.Learnables.Value{bIdx} = dlarray(single(zeros(bSize)));
+    end
+
+    fprintf('已重新初始化最后一层卷积（%s）的权重，以降低初始Loss。\n', finalConvName);
+end
+
 fprintf('3D U-Net 网络构建完成，共 %d 层。\n\n', numel(net.Layers));
 
 %% ==================== 第5步：配置训练选项 ====================
@@ -217,6 +251,7 @@ options = trainingOptions('adam', ...
     'LearnRateDropFactor', 0.5, ...
     'LearnRateDropPeriod', 15, ...
     'L2Regularization', 1e-4, ...
+    'GradientThreshold', 5, ...
     'Plots', 'training-progress', ...
     'Verbose', true, ...
     'VerboseFrequency', 5, ...
@@ -255,11 +290,17 @@ testVol = zeros(H, W, numSlices, 'uint16');
 for s = 1:numSlices
     testVol(:,:,s) = imread(testImgPath, s);
 end
-testMaxVal = single(max(testVol(:)));
-if testMaxVal > 0
-    testVol = single(testVol) / testMaxVal;
+testVol = single(testVol);
+pLow  = prctile(testVol(:), 0.5);
+pHigh = prctile(testVol(:), 99.5);
+if pHigh > pLow
+    testVol = (testVol - pLow) / (pHigh - pLow);
+    testVol = max(min(testVol, 1), 0);
 else
-    testVol = single(testVol);
+    testMaxVal = max(testVol(:));
+    if testMaxVal > 0
+        testVol = testVol / testMaxVal;
+    end
 end
 
 % 读取测试标签
