@@ -263,7 +263,7 @@ fprintf('训练选项配置完成。\n\n');
 fprintf('=== 第6步：开始训练 ===\n');
 fprintf('正在使用 trainnet 进行训练，请等待...\n');
 
-[net, info] = trainnet(dsTrain, net, "crossentropy", options);
+[net, info] = trainnet(dsTrain, net, @customSegmentationLoss, options);
 
 fprintf('训练完成！\n\n');
 
@@ -436,4 +436,40 @@ function data = loadMatField(filename, fieldName)
 %LOADMATFIELD 从 .mat 文件中加载指定字段
     s = load(filename, fieldName);
     data = s.(fieldName);
+end
+
+function loss = customSegmentationLoss(Y, T)
+%CUSTOMSEGMENTATIONLOSS 交叉熵 + Dice 联合损失函数（适用于3D语义分割）
+%   Y: 网络输出的原始 logits (dlarray, SSSCB 格式: [H,W,D,C,B])
+%   T: one-hot 编码的目标标签 (dlarray, SSSCB 格式: [H,W,D,C,B])
+%
+%   该函数显式地对 logits 执行 softmax，然后计算交叉熵和 Dice 损失。
+%   两项损失均为非负值，因此总损失不会出现负数。
+
+    % 数值稳定性常量
+    EPSILON = single(1e-7);  % 防止 log(0)
+    SMOOTH  = single(1e-5);  % Dice 系数平滑项，防止分母为零
+
+    % 沿通道维度(第4维, SSSCB 中的 C)执行 softmax，得到类别概率
+    channelDim = 4;
+    P = exp(Y - max(Y, [], channelDim));
+    P = P ./ sum(P, channelDim);
+
+    % --- 交叉熵损失 ---
+    % 裁剪概率以避免 log(0) 导致的数值问题
+    P_clip = max(P, EPSILON);
+    % 沿通道维度求和，然后取所有空间维度和批次维度的均值
+    ceLoss = -mean(sum(T .* log(P_clip), channelDim), 'all');
+
+    % --- Dice 损失 ---
+    % Dice 损失天然适合处理类别不平衡问题
+    % 沿空间维度 (1,2,3) 求和，保留通道和批次维度
+    inter = sum(sum(sum(P .* T, 1), 2), 3);            % [1,1,1,C,B]
+    denom = sum(sum(sum(P, 1), 2), 3) + ...
+            sum(sum(sum(T, 1), 2), 3);                  % [1,1,1,C,B]
+    diceCoeff = (2 * inter + SMOOTH) ./ (denom + SMOOTH); % 每类的 Dice 系数
+    diceLoss  = 1 - mean(diceCoeff, 'all');
+
+    % 联合损失（两项均 >= 0）
+    loss = ceLoss + diceLoss;
 end
