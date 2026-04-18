@@ -15,6 +15,13 @@
 %   data/
 %     image/  -> image1.tif, image2.tif, image3.tif  (uint16, 多页3D体积)
 %     label/  -> label1.tif, label2.tif, label3.tif  (uint8, 0和255二值标签)
+%
+% 修改说明：
+%   1. 修复初始训练loss异常高(~10)的问题：重新初始化最后卷积层权重
+%   2. 修复数据泄漏：将第3个体积从训练集中移除，仅用于测试
+%   3. 改进归一化：使用百分位数归一化替代最大值归一化
+%   4. 增加标签值校验，处理异常标签值
+%   5. 增加类别频率统计，为后续加权损失提供信息
 
 clear; clc; close all;
 
@@ -44,9 +51,14 @@ labelDir = fullfile(dataDir, 'label');
 patchDir = fullfile(tempdir, 'unet3d_patches');
 
 % 文件列表（图像和标签一一对应）
-imageFiles = {'image1.tif', 'image2.tif', 'image3.tif'};
-labelFiles = {'label1.tif', 'label2.tif', 'label3.tif'};
-numVolumes = numel(imageFiles);
+% 注意：仅使用前2个体积进行训练，第3个体积用于测试（避免数据泄漏）
+trainImageFiles = {'image1.tif', 'image2.tif'};
+trainLabelFiles = {'label1.tif', 'label2.tif'};
+numTrainVolumes = numel(trainImageFiles);
+
+% 测试体积
+testImageFile = 'image3.tif';
+testLabelFile = 'label3.tif';
 
 %% ==================== 第1步：读取数据并提取分块 ====================
 fprintf('=== 第1步：读取数据并提取分块 ===\n');
@@ -58,12 +70,14 @@ if ~exist(imgPatchDir, 'dir'), mkdir(imgPatchDir); end
 if ~exist(lblPatchDir, 'dir'), mkdir(lblPatchDir); end
 
 patchCount = 0;
+totalFG = 0;  % 前景体素总数
+totalBG = 0;  % 背景体素总数
 
-for v = 1:numVolumes
-    fprintf('正在处理第 %d/%d 个体积数据...\n', v, numVolumes);
+for v = 1:numTrainVolumes
+    fprintf('正在处理第 %d/%d 个训练体积数据...\n', v, numTrainVolumes);
 
     % --- 读取多页TIF图像 ---
-    imgPath = fullfile(imageDir, imageFiles{v});
+    imgPath = fullfile(imageDir, trainImageFiles{v});
     infoImg = imfinfo(imgPath);
     numSlices = numel(infoImg);
     H = infoImg(1).Height;
@@ -75,7 +89,7 @@ for v = 1:numVolumes
     end
 
     % --- 读取多页TIF标签 ---
-    lblPath = fullfile(labelDir, labelFiles{v});
+    lblPath = fullfile(labelDir, trainLabelFiles{v});
     lbl = zeros(H, W, numSlices, 'uint8');
     for s = 1:numSlices
         lbl(:,:,s) = imread(lblPath, s);
@@ -85,18 +99,32 @@ for v = 1:numVolumes
         size(vol, 1), size(vol, 2), size(vol, 3), ...
         size(lbl, 1), size(lbl, 2), size(lbl, 3));
 
-    % --- 将图像归一化到 [0, 1] ---
-    maxVal = single(max(vol(:)));
-    if maxVal > 0
-        vol = single(vol) / maxVal;
+    % --- 校验标签值 ---
+    uniqueLabels = unique(lbl(:));
+    invalidLabels = setdiff(uniqueLabels, [0, 255]);
+    if ~isempty(invalidLabels)
+        warning('体积 %d 标签中包含非预期值: %s。将非0非255的值视为背景。', ...
+            v, mat2str(invalidLabels'));
+    end
+
+    % --- 使用百分位数归一化（更鲁棒，避免离群值影响） ---
+    volSingle = single(vol(:));
+    pLow  = prctile(volSingle, 0.5);
+    pHigh = prctile(volSingle, 99.5);
+    if pHigh > pLow
+        vol = (single(vol) - pLow) / (pHigh - pLow);
+        vol = max(min(vol, 1), 0);  % 截断到 [0, 1]
     else
-        vol = single(vol);
+        vol = single(vol) / max(single(max(vol(:))), 1);
     end
 
     % --- 将标签转换为类别索引：0->1(背景), 255->2(前景) ---
-    lblIdx = zeros(size(lbl), 'uint8');
-    lblIdx(lbl == 0)   = 1;  % 背景
-    lblIdx(lbl == 255) = 2;  % 前景
+    lblIdx = ones(size(lbl), 'uint8');   % 默认为背景(1)
+    lblIdx(lbl == 255) = 2;              % 前景(2)
+
+    % 统计类别频率
+    totalBG = totalBG + sum(lblIdx(:) == 1);
+    totalFG = totalFG + sum(lblIdx(:) == 2);
 
     % --- 提取非重叠分块并保存到磁盘 ---
     [vH, vW, vD] = size(vol);
@@ -130,7 +158,9 @@ for v = 1:numVolumes
     fprintf('  已从该体积提取分块。\n');
 end
 
-fprintf('分块提取完成，共 %d 个分块。\n\n', patchCount);
+fprintf('分块提取完成，共 %d 个分块。\n', patchCount);
+fprintf('类别统计 - 背景体素: %d, 前景体素: %d, 前景比例: %.4f%%\n\n', ...
+    totalBG, totalFG, 100 * totalFG / (totalBG + totalFG));
 
 %% ==================== 第2步：划分训练集和验证集 ====================
 fprintf('=== 第2步：划分训练集和验证集 ===\n');
@@ -198,6 +228,35 @@ end
 % 转换为 dlnetwork 以配合 trainnet 使用
 net = dlnetwork(lgraph);
 
+% --- 关键修复：重新初始化最后卷积层的权重 ---
+% unet3dLayers 的默认 He 初始化可能导致最后卷积层输出的 logits 过大，
+% 从而使 softmax 输出极端（接近0或1），导致初始交叉熵损失异常高（~10）。
+% 通过缩小最后卷积层的权重，使初始 logits 接近零，
+% softmax 输出更均匀（接近 1/numClasses），初始损失接近理论值 ln(2)≈0.693。
+finalConvIdx = [];
+for i = numel(net.Layers):-1:1
+    if isa(net.Layers(i), 'nnet.cnn.layer.Convolution3DLayer')
+        finalConvIdx = i;
+        break;
+    end
+end
+if ~isempty(finalConvIdx)
+    layerName = net.Layers(finalConvIdx).Name;
+    fprintf('重新初始化最后卷积层 "%s" 的权重（缩小至0.01倍）\n', layerName);
+
+    % 缩小权重至0.01倍，使初始logits接近零
+    wIdx = find(net.Learnables.Layer == string(layerName) & ...
+                net.Learnables.Parameter == "Weights");
+    origW = extractdata(net.Learnables{wIdx, 3}{1});
+    net.Learnables{wIdx, 3} = {dlarray(0.01 * origW)};
+
+    % 将偏置归零
+    bIdx = find(net.Learnables.Layer == string(layerName) & ...
+                net.Learnables.Parameter == "Bias");
+    origB = extractdata(net.Learnables{bIdx, 3}{1});
+    net.Learnables{bIdx, 3} = {dlarray(zeros(size(origB), 'like', origB))};
+end
+
 fprintf('3D U-Net 网络构建完成，共 %d 层。\n\n', numel(net.Layers));
 
 %% ==================== 第5步：配置训练选项 ====================
@@ -241,9 +300,9 @@ fprintf('模型已保存至 trainedUNet3D.mat\n\n');
 %% ==================== 第8步：对测试体积进行推理 ====================
 fprintf('=== 第8步：对测试体积进行推理 ===\n');
 
-% 读取第3个体积作为测试数据
-testImgPath = fullfile(imageDir, imageFiles{3});
-testLblPath = fullfile(labelDir, labelFiles{3});
+% 读取第3个体积作为测试数据（该体积未参与训练，避免数据泄漏）
+testImgPath = fullfile(imageDir, testImageFile);
+testLblPath = fullfile(labelDir, testLabelFile);
 
 infoTest  = imfinfo(testImgPath);
 numSlices = numel(infoTest);
@@ -255,11 +314,15 @@ testVol = zeros(H, W, numSlices, 'uint16');
 for s = 1:numSlices
     testVol(:,:,s) = imread(testImgPath, s);
 end
-testMaxVal = single(max(testVol(:)));
-if testMaxVal > 0
-    testVol = single(testVol) / testMaxVal;
+% 使用与训练相同的百分位数归一化方式
+testVolSingle = single(testVol(:));
+tpLow  = prctile(testVolSingle, 0.5);
+tpHigh = prctile(testVolSingle, 99.5);
+if tpHigh > tpLow
+    testVol = (single(testVol) - tpLow) / (tpHigh - tpLow);
+    testVol = max(min(testVol, 1), 0);
 else
-    testVol = single(testVol);
+    testVol = single(testVol) / max(single(max(testVol(:))), 1);
 end
 
 % 读取测试标签
