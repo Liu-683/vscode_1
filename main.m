@@ -29,7 +29,7 @@ encoderDepth  = 3;                 % U-Net编码器深度
 
 % 训练参数
 initialLR     = 1e-3;             % 初始学习率
-maxEpochs     = 50;               % 最大训练轮数
+maxEpochs     = 10;               % 最大训练轮数
 miniBatchSize = 2;                 % 每批次样本数（3D体积占用大量显存，建议根据GPU内存调整）
 valRatio      = 0.2;              % 验证集比例
 
